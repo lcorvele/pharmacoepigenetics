@@ -1,5 +1,6 @@
 # Pharmacoepigenetics
-Custom R-scripts used in manuscript: Profiling histone post-translational modifications to identify signatures of epigenetic drug response in T-cell acute lymphoblastic leukemia
+Custom R-scripts used in manuscript: Profiling histone post-translational modifications to identify signatures of epigenetic drug response in T-cell acute lymphoblastic leukemia.
+Used input files (csv or xlsx format) are included.
 
 ## msqrob2PTM folder:
 Uses the raw peptidoform abundances exported from Progenesis QIP software as input to obtain single PTM values. 
