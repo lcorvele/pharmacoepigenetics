@@ -1,0 +1,496 @@
+---
+title: "ALL"
+output:
+  html_document:
+    code_download: yes
+    theme: cosmo
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: yes
+    highlight: tango
+    number_sections: yes
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+
+# Install packages
+
+```
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("QFeatures")
+BiocManager::install("msqrob2")
+install.packages("tidyverse")
+install.packages("gt")
+install.packages("plotly")
+install.packages("ggplot2")
+BiocManager::install("stageR")
+install.packages("poolr")
+install.packages("RColorBrewer")
+install.packages("seqinr")
+install.packages("stringr")
+BiocManager::install("ExploreModelMatrix")
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE}
+library(QFeatures)
+library(msqrob2)
+library(tidyverse)
+library(gt)
+library(plotly)
+library(ggplot2)
+library(stageR)
+library(poolr)
+library(RColorBrewer)
+library(seqinr)
+library(stringr)
+library(ExploreModelMatrix)
+```
+
+
+# Import data
+
+
+```{r}
+df <- df <- read.csv("C:/Users/lcorvele/R/msqrob2PTM/Pharmacoepigenetics/241213_all_histones_all_cell_lines_parsed_doubles_removed.csv",header=TRUE,skip=0)
+ecols = grep("X20210224", colnames(df))
+#order dataframe by protein, for the normalisation step
+df = df[order(df$Protein),]
+df$peptidoform <- paste(df$Sequence, df$Variable.modifications...position..description., sep = "_")
+pe <- readQFeatures(df,ecol= ecols, name="peptidoformRaw", fnames = "peptidoform")
+```
+
+## Experimental Layout
+
+```{r}
+#Get condition name from column names
+colData(pe)$Cell_line <- sapply(str_split(rownames(colData(pe)), "_"), function(x) x[3])
+colData(pe)$Cell_line <- as.factor(colData(pe)$Cell_line)
+colData(pe)$Cell_line <- relevel(colData(pe)$Cell_line, ref = "QC")
+colData(pe)
+```
+
+
+## Preprocessing
+
+```{r}
+print(nrow(pe[["peptidoformRaw"]]))
+#Get number of columns values per row that are larger than zero 
+rowData(pe[["peptidoformRaw"]])$nNonZero <- rowSums(assay(pe[["peptidoformRaw"]]) > 0)
+#Change the zeroes into NA values, because they represent missing values, not values of zero intensity
+pe <- zeroIsNA(pe, i = "peptidoformRaw")
+#Filter out peptides with too many missing values
+pe <- pe[rowData(pe[["peptidoformRaw"]])$nNonZero>6,,]
+#Log transform the intensity values
+pe <- logTransform(pe, i = "peptidoformRaw", base = 2, name = "peptidoformLog")
+pe <- normalize(pe, i = "peptidoformLog", method = "center.median", name = "peptidoform")
+print(nrow(pe[["peptidoform"]]))
+```
+
+```{r}
+master_proteins <- c("H1_HUMAN", "H2A_HUMAN", "H2B_HUMAN", "H31_HUMAN", "H33_HUMAN", "H4_HUMAN")
+rowData(pe[["peptidoform"]])$Master_Protein <- case_when(
+  grepl(pattern = "H1", rowData(pe[["peptidoform"]])$Protein) ~ "H1_HUMAN",
+  grepl(pattern = "H2A", rowData(pe[["peptidoform"]])$Protein) ~ "H2A_HUMAN",
+  grepl(pattern = "H2B", rowData(pe[["peptidoform"]])$Protein) ~ "H2B_HUMAN",
+  grepl(pattern = "H32", rowData(pe[["peptidoform"]])$Protein) ~ "H32_HUMAN",
+  grepl(pattern = "H33", rowData(pe[["peptidoform"]])$Protein) ~ "H33_HUMAN",
+  grepl(pattern = "H4", rowData(pe[["peptidoform"]])$Protein) ~ "H4_HUMAN"
+)
+```
+
+## Normalisation via robust summarisation
+
+We will now perform a normalisation of the peptidoform values.
+For this, we need the summarised intensity values for every protein present in the dataset, 
+which we obtain by using the aggregateFeatures function.
+This function takes all peptidoforms from one protein and summarises its intensity values into one intensity value per sample for that protein.
+Here, the funtion with which it does this is the robustSummary function from the MsCoreUtils package which utilises robust regression.
+
+Now, the question is whether to take the variants of certain histones separately or not
+
+```{r,warning=FALSE}
+#list to store summarised values per protein
+pe_robustval <- list()
+
+pe <- aggregateFeatures(pe,
+ i = "peptidoform",
+ fcol = "Master_Protein",
+ na.rm = TRUE,
+ name = "proteinRobust",
+ fun = MsCoreUtils::robustSummary)
+
+#Fill out list with the summarised values
+for (prot in unique(rowData(pe)[["peptidoform"]]$Master_Protein)){
+  print(prot)
+pe_robustval[[prot]] = assay(pe[["proteinRobust"]])[prot,]
+}
+```
+
+We then use these intensity values for each protein to normalise our dataframe.
+For each protein, all its peptidoforms are taken and from their corresponding intensity values the summarised protein intensity value (per sample) is subtracted. 
+
+```{r}
+y <- as_tibble(assay(pe[["peptidoform"]]))
+y_new <- tibble()
+rowdata <- tibble()
+for (prot in unique(rowData(pe)[["peptidoform"]]$Master_Protein)){
+  pe_sub <- pe[["peptidoform"]][grepl(prot, rowData(pe[["peptidoform"]])$Master_Protein, fixed = T),]
+  y_ <- as_tibble(assay(pe_sub))
+  #center assay based on the corresponding protein value
+  y_scale <- base::scale(y_, center = pe_robustval[[prot]], scale = FALSE) 
+  rownames(y_scale) <- rownames(assay(pe_sub))
+  y_new <- rbind(y_new, y_scale)
+  rowdata <- rbind(rowdata, as.data.frame(rowData(pe_sub)))
+}
+```
+
+
+```{r}
+#Add the normalised assay as a new assay to the existing pe
+y_assay <- SummarizedExperiment(assays=as.matrix(y_new), rowData=rowdata, colData=colData(pe[["peptidoform"]]))
+#Filter out peptidoforms that now have 0 intensities everywhere
+rowData(y_assay)$nNonZero2 <- rowSums(assay(y_assay)!=0, na.rm = T)
+y_assay <- y_assay[rowData(y_assay)$nNonZero2>0,]
+pe <- addAssay(pe, y_assay, name = "peptidoformNorm2")
+pe <- QFeatures::normalize(pe, method = "center.median", i = "peptidoformNorm2",
+                           name = "peptidoformNorm")
+rowData(pe[["peptidoformNorm"]])$peptidoform <- rownames(pe[["peptidoformNorm"]])
+```
+
+```{r}
+pe <- zeroIsNA(pe, "peptidoformNorm")
+```
+
+```{r fig1, fig.height = 10, fig.width = 13}
+limma::plotDensities(assay(pe[["peptidoformNorm"]]), col = as.numeric(colData(pe)$Cell_line))
+```
+
+```{r,}
+boxplot(assay(pe[["peptidoformNorm"]]), col = colData(pe)$Cell_line,
+        main = "Peptide distributions after Normalisation", ylab = "intensity")
+```
+
+# Differential peptidoform usage (DPFU)
+
+We first check whether there are differentially used peptidoforms present.
+
+## Hypothesistest for each contrast
+
+We model the peptidoform level expression values using msqrob. 
+
+
+We will model the data with the groups incoded in the colData. We want to know whether there is difference in peptidoform usage between all cellines. 
+
+```{r}
+#We specify at least the object, the assay and the formula in the function
+
+pe <- msqrob2::msqrob(object = pe, i = "peptidoformNorm", formula = ~Cell_line, robust=FALSE, overwrite = T)
+#We want to see the parameter names of the model
+rowData(pe[["peptidoformNorm"]])$msqrobModels[[2]] %>%
+                  getCoef
+```
+
+
+
+```{r}
+contrasts <- c("Cell_line000.AZE", "Cell_lineAA", "Cell_lineCA", "Cell_lineGA", "Cell_lineJG", "Cell_lineLDV", "Cell_lineMaTil", "Cell_lineMT", "Cell_lineNH", "Cell_lineNK", "Cell_lineOS", "Cell_linePTST", "Cell_lineVF")
+for (contrast in contrasts) {
+  contrast <- paste(contrast, " = 0")
+  L <- makeContrast(contrast,
+                  parameterNames = rowData(pe[["peptidoformNorm"]])$msqrobModels[[1]] %>%
+                  getCoef %>%
+                  names)
+  #the default multiple testing correction is Benjamini Hochberg FDR correction
+  pe <- hypothesisTest(object = pe, i = "peptidoformNorm", contrast = L, overwrite = T)
+}
+```
+
+### Volcanoplot 
+
+```{r}
+volcano <- list()
+for (contrast in contrasts){
+volcano[[contrast]] <- rowData(pe[["peptidoformNorm"]])[[contrast]]%>%
+            ggplot(aes(x = logFC, y = -log10(pval), 
+                   color = adjPval < 0.05,
+                   annotation=rowData(pe[["peptidoformNorm"]])[,3])) +
+  geom_point(cex = 2.5) +
+  scale_color_manual(values = alpha(c("black", "red"), 0.5)) + 
+  theme_minimal() +
+  ylab("-log10(pvalue)") +
+  ggtitle(contrast) +
+  xlim(-5,5)
+}
+volcano
+```
+
+### Volcanoplot only H3&H4
+
+```{r}
+volcano <- list()
+for (contrast in contrasts){
+volcano[[contrast]] <- rowData(pe[["peptidoformNorm"]]) %>% as.data.frame %>% 
+  filter(Master_Protein == "H31_HUMAN" | Master_Protein == "H4_HUMAN") %>%
+            ggplot(aes(x = logFC, 
+                       y = -log10(pval), 
+                   color = conditionpatient.adjPval < 0.05)) +
+#                   annotation=rowData(pe[["peptidoformNorm"]])[,3])) +
+  geom_point(cex = 2.5) +
+  scale_color_manual(values = alpha(c("black", "red"), 0.5)) + 
+  theme_minimal(
+  ) +
+  ylab("-log10(pvalue)") +
+  xlab("logFC") +
+  labs(color = "adjPval < 0.05") +
+  ggtitle(contrast) +
+  xlim(-5,5)
+}
+volcano
+```
+
+### Significant peptidoforms for each contrast
+
+
+```{r}
+tables <- list()
+for (contrast in contrasts){
+sigTable <- rowData(pe[["peptidoformNorm"]])[[contrast]]
+sigTable <- sigTable %>%
+  na.exclude %>%
+  arrange(pval) %>%
+  mutate(
+    se = format(se, digits = 2), 
+    df = format(df, digits =2),
+    t = format(t, digits = 2),
+    adjPval = format(adjPval, digits = 3),
+    rank = 1:length(logFC) 
+  ) 
+sigTable_print <- sigTable %>% mutate(peptidoform = rownames(sigTable)) %>% gt() %>% tab_header(title = md(contrast))
+tables[[contrast]] <- sigTable
+
+}
+knitr::kable(tables)
+```
+
+
+
+# DPTM
+
+## ptm summarisation
+
+In this step we will summarise the peptidoform level data to ptm level data.
+
+### Get location of modification in protein
+
+For this we need the location information of each modification in the protein.
+
+
+### Get ptm level intensity matrix
+
+In our case, a ptm is a unique protein - modification(+location) combination.
+
+```{r}
+#Add ptm variable = protein + modification
+rowData(pe[["peptidoformNorm"]])$ptm <- ifelse(rowData(pe[["peptidoformNorm"]])$"Variable.modifications...position..description." != "",
+                                               paste(rowData(pe[["peptidoformNorm"]])$Master_Protein, rowData(pe[["peptidoformNorm"]])$"Variable.modifications...position..description.", sep="_"), 
+                                               "")
+```
+
+First, we need a vector of all of these unique ptms.
+
+```{r}
+prots <- unique(rowData(pe[["peptidoformNorm"]])$Master_Protein)
+#Do for each protein
+ptms <- sapply(prots, function(i) {
+  pe_sub <- pe[["peptidoformNorm"]][grepl(i, rowData(pe[["peptidoformNorm"]])$Master_Protein, fixed = T),]
+  #Get all unique modifications present on that protein
+  mods <- unique(unlist(strsplit(rowData(pe_sub)$"Variable.modifications...position..description.", split = "|", fixed = TRUE)))
+  #Add protein info to mods
+  ptm <- paste(rep(i, length(mods)), mods)
+  #return all the protein-mods combinations
+  ptm
+})
+ptms <- as.vector(unlist(ptms))
+```
+
+For every unique ptm, we take all its associated peptidoforms and aggregate all its intensity values per sample into one intensity value per sample for that ptm.
+
+```{r}
+#For each ptm do
+ptm_x_assay <- sapply(seq(1:length(ptms)), function(i){ 
+  x <- ptms[i]
+  #Get current protein and mod from ptm
+  prot <- str_split(x, " ", 2)[[1]][1]
+  current_ptm <- str_split(x, " ", 2)[[1]][2]
+  #filter on that protein and on that mod to obtain all peptidoforms that correspond to the ptm
+  pe_sub <- pe[["peptidoformNorm"]][grepl(prot, rowData(pe[["peptidoformNorm"]])$Master_Protein, fixed = T),]
+  ptm_sub <- pe_sub[grepl(current_ptm, rowData(pe_sub)$"Variable.modifications...position..description.", fixed = T),]
+  #Get intensity values of those peptidoforms
+  y <- assay(ptm_sub)
+  #And summarise them to 1 row of intensity values: 1 value per sample for that ptm
+  if (any(is.finite(y))){
+  ptm_y <- MsCoreUtils::robustSummary(y)
+  }
+  else {ptm_y <- rep(NA, ncol(y))}
+  ptm_y
+})
+#Then we get the intensity assay on ptm level
+ptm_x_assay <- t(ptm_x_assay)
+rownames(ptm_x_assay) <- ptms
+colnames(ptm_x_assay) <- colnames(assay(pe[["peptidoformNorm"]]))
+```
+
+### Make new QFeatures object
+
+From this assay, we make a new QFeatures object and fill out its rowData and colData
+
+```{r}
+ptm <- readQFeatures(as.data.frame(ptm_x_assay),ecol= 1:ncol(ptm_x_assay),name="ptm")
+ptm <- renamePrimary(ptm, rownames(colData(pe)))
+colData(ptm) <- colData(pe)
+ptm <- renamePrimary(ptm, rownames(colData(pe)))
+rownames(ptm[["ptm"]]) <- rownames(ptm_x_assay)
+```
+
+```{r}
+rowData(ptm[["ptm"]])$Protein <- sapply(str_split(rownames(ptm[["ptm"]]), pattern=" ", n=2),function(x) x[1])
+rowData(ptm[["ptm"]])$modification <- sapply(str_split(rownames(ptm[["ptm"]]), pattern=" ", n=2),function(x) x[2])
+```
+
+## Hypothesistest for each contrast
+
+```{r}
+#We specify at least the object, the assay and the formula in the function
+ptm <- msqrob2::msqrob(object = ptm, i = "ptm", formula = ~Cell_line, robust=TRUE, overwrite = T)
+#We want to see the parameter names of the model
+rowData(ptm[["ptm"]])$msqrobModels[[2]] %>%
+                  getCoef
+```
+
+
+
+```{r}
+contrasts <- c("Cell_line000.AZE", "Cell_lineAA", "Cell_lineCA", "Cell_lineGA", "Cell_lineJG", "Cell_lineLDV", "Cell_lineMaTil", "Cell_lineMT", "Cell_lineNH", "Cell_lineNK", "Cell_lineOS", "Cell_linePTST", "Cell_lineVF")
+for (contrast in contrasts) {
+  contrast <- paste(contrast, " = 0")
+  L <- makeContrast(contrast,
+                  parameterNames = rowData(ptm[["ptm"]])$msqrobModels[[1]] %>%
+                  getCoef %>%
+                  names)
+  #the default multiple testing correction is Benjamini Hochberg FDR correction
+  ptm <- hypothesisTest(object = ptm, i = "ptm", contrast = L)
+}
+```
+
+## Significant PTMs for each contrast
+
+```{r}
+tables <- list()
+for (contrast in contrasts){
+  
+sigTable <- rowData(ptm[["ptm"]])[[contrast]]
+sigTable <- sigTable %>%
+  na.exclude %>%
+  arrange(pval) %>%
+  mutate(
+    se = format(se, digits = 2), 
+    df = format(df, digits =2),
+    t = format(t, digits = 2),
+    adjPval = format(adjPval, digits = 3),
+    rank = 1:length(logFC) 
+  ) 
+# Rename the first column to "PTM"
+colnames(sigTable)[0] <- "PTM"
+
+sigTable_print <- sigTable %>% 
+  gt() %>% 
+  tab_header(title = md(contrast))
+
+tables[[contrast]] <- sigTable
+
+write.csv(sigTable, file = paste("./", contrast, ".csv"))
+}
+knitr::kable(tables)
+```
+
+
+```{r}
+for (contrast in contrasts){
+sigTable <- rowData(ptm[["ptm"]])[[contrast]]
+sigTable <- sigTable %>% filter(adjPval<0.05)
+ptms <- rownames(sigTable)
+if ("H3C_HUMAN [27] (K) Me3" %in% ptms){
+  print(contrast)
+}
+}
+```
+
+### Volcanoplot 
+
+```{r}
+volcano <- list()
+for (contrast in contrasts){
+volcano[[contrast]] <- rowData(ptm[["ptm"]])[[contrast]]%>%
+            ggplot(aes(x = logFC, y = -log10(pval), 
+                   color = adjPval < 0.05,
+                   annotation=rowData(ptm[["ptm"]])[,3])) +
+  geom_point(cex = 2.5) +
+  scale_color_manual(values = alpha(c("black", "red"), 0.5)) + 
+  theme_minimal() +
+  ylab("-log10(pvalue)") +
+  ggtitle(contrast) +
+  xlim(-5,5)
+}
+volcano
+```
+
+### Volcanoplot only H3&H4
+
+```{r}
+volcano <- list()
+for (contrast in contrasts){
+volcano[[contrast]] <- rowData(ptm[["ptm"]]) %>% as.data.frame %>% 
+  filter(Protein == "H32_HUMAN" | Protein == "H4_HUMAN") %>%
+            ggplot(aes(x = conditionpatient.logFC, 
+                       y = -log10(conditionpatient.pval), 
+                   color = conditionpatient.adjPval < 0.05)) +
+#                   annotation=rowData(ptm[["ptm"]])[,3])) +
+  geom_point(cex = 2.5) +
+  scale_color_manual(values = alpha(c("black", "red"), 0.5)) + 
+  theme_minimal() +
+  ylab("-log10(pvalue)") +
+  xlab("logFC") +
+  labs(color = "adjPval < 0.05")
+  ggtitle(contrast) +
+  xlim(-5,5)
+}
+volcano
+```
+
+## Output tables
+
+```{r}
+write.csv(2^assay(pe[["peptidoformNorm"]]), "C:/Users/lcorvele/R/msqrob2PTM/Pharmacoepigenetics/Cell_lines_peptidoform_untransformed_data.csv")
+
+write.csv(assay(pe[["peptidoformNorm"]]), "C:/Users/lcorvele/R/msqrob2PTM/Pharmacoepigenetics/Cell_lines_peptidoform_data.csv")
+
+write.csv(ptm_x_assay, "C:/Users/lcorvele/R/msqrob2PTM/Pharmacoepigenetics/Cell_lines_sPTM_data.csv")
+
+write.csv(2^ptm_x_assay, "C:/Users/lcorvele/R/msqrob2PTM/Pharmacoepigenetics/Cell_lines_sPTM_data_untransformed.csv")
+```
+
+
+
+
+
+
+
