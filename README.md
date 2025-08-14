@@ -12,6 +12,7 @@ Molecular & Cellular Proteomics, Volume 23, Issue 2, 100708
 
 ## Heatmap folder:
 Baseline: uses sPTM or peptidoform values for heatmap visualisation. (Fig 1, 4B)
+
 Drug sens: calculates pearson coefficients between sensitivity metriccs (AUC or IC50) and sPTM values and creates a heatmap. (Fig 2A, 5A)
 
 ## Covariation analysis folder:
